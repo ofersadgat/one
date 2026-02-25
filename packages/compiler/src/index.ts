@@ -404,7 +404,9 @@ ${rootJS.code}
                         async (args) => {
                           perfStats.optimizeDeps.byEnvironment[environment].filesChecked++
 
-                          const production = process.env.NODE_ENV === 'production'
+                          const production =
+                            process.env.NODE_ENV === 'production' ||
+                            process.env.NODE_ENV === 'test'
                           const code = await readFile(args.path, 'utf-8')
 
                           debug?.(`[esbuild optimizeDeps] ${args.path}`)
@@ -494,6 +496,7 @@ ${rootJS.code}
         const environment = getEnvName(this.environment.name)
         const isNative = environment === 'ios' || environment === 'android'
         const production =
+          config.command === 'build' ||
           process.env.NODE_ENV === 'production' ||
           JSON.parse(
             this.environment.config?.define?.['process.env.NODE_ENV'] || '""'

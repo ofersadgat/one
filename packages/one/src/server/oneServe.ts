@@ -72,6 +72,29 @@ export async function oneServe(
 
   const { routeToBuildInfo, routeMap } = buildInfo as One.BuildInfo
 
+  // find nearest +not-found path by walking up from a url path
+  function findNearestNotFoundPath(urlPath: string): string {
+    let cur = urlPath
+    while (cur) {
+      const parent = cur.lastIndexOf('/') > 0 ? cur.slice(0, cur.lastIndexOf('/')) : ''
+      if (routeMap[`${parent}/+not-found`]) {
+        return `${parent}/+not-found`
+      }
+      if (!parent) break
+      cur = parent
+    }
+    return '/+not-found'
+  }
+
+  // generate a 404 loader response that triggers client-side not-found navigation
+  function make404LoaderJs(path: string, logReason?: string): string {
+    const nfPath = findNearestNotFoundPath(path)
+    if (logReason) {
+      console.error(`[one] 404 loader for ${path}: ${logReason}`)
+    }
+    return `export function loader(){return{__oneError:404,__oneErrorMessage:'Not Found',__oneNotFoundPath:${JSON.stringify(nfPath)}}}`
+  }
+
   const serverOptions = {
     ...oneOptions,
     root: '.',
@@ -151,7 +174,20 @@ export async function oneServe(
         return null
       }
 
-      const json = await loader(loaderProps)
+      let json
+      try {
+        json = await loader(loaderProps)
+      } catch (err) {
+        // for file-not-found errors (e.g., missing MDX for non-existent slug),
+        // return a 404 signal so the client navigates to +not-found
+        if ((err as any)?.code === 'ENOENT') {
+          return make404LoaderJs(
+            loaderProps?.path || '/',
+            `ENOENT ${(err as any)?.path || err}`
+          )
+        }
+        throw err
+      }
 
       // if the loader returned a Response (e.g. redirect()), throw it
       // so it bubbles up through resolveResponse and can be transformed
@@ -175,11 +211,6 @@ export async function oneServe(
         }
 
         try {
-          // Use lazy import if available (workers), otherwise dynamic import (Node.js)
-          const exported = options?.lazyRoutes?.pages?.[route.file]
-            ? await options.lazyRoutes.pages[route.file]()
-            : await import(toAbsolute(buildInfo.serverJsPath))
-
           // helper to import and run a single loader
           async function runLoader(
             routeId: string,
@@ -450,46 +481,44 @@ url: ${url}`)
         // dynamic route matched but no static HTML exists for this path
         // (slug wasn't in generateStaticParams) - return 404
         if (isDynamicRoute) {
-          // find nearest +not-found.html by walking up the path
-          let currentPath = url.pathname
-          while (currentPath) {
-            const parentDir =
-              currentPath.lastIndexOf('/') > 0
-                ? currentPath.slice(0, currentPath.lastIndexOf('/'))
-                : ''
-            const notFoundPath = routeMap[`${parentDir}/+not-found`]
+          const notFoundRoute = findNearestNotFoundPath(url.pathname)
+          const notFoundHtmlPath = routeMap[notFoundRoute]
 
-            if (notFoundPath) {
-              const fetchStaticHtml = getFetchStaticHtml()
-              let notFoundHtml: string | null = null
+          if (notFoundHtmlPath) {
+            const fetchStaticHtml = getFetchStaticHtml()
+            let notFoundHtml: string | null = null
 
-              if (fetchStaticHtml) {
-                notFoundHtml = await fetchStaticHtml(notFoundPath)
-              }
+            if (fetchStaticHtml) {
+              notFoundHtml = await fetchStaticHtml(notFoundHtmlPath)
+            }
 
-              if (!notFoundHtml) {
-                try {
-                  notFoundHtml = await readFile(
-                    join('dist/client', notFoundPath),
-                    'utf-8'
-                  )
-                } catch {
-                  // File not found
-                }
-              }
-
-              if (notFoundHtml) {
-                const headers = new Headers()
-                headers.set('content-type', 'text/html')
-                return new Response(notFoundHtml, {
-                  headers,
-                  status: 404,
-                })
+            if (!notFoundHtml) {
+              try {
+                notFoundHtml = await readFile(
+                  join('dist/client', notFoundHtmlPath),
+                  'utf-8'
+                )
+              } catch {
+                // File not found
               }
             }
 
-            if (!parentDir) break
-            currentPath = parentDir
+            if (notFoundHtml) {
+              // inject 404 marker so client knows this is a 404 response
+              // this prevents hydration mismatch when the URL matches a dynamic route
+              const notFoundMarker = `<script>window.__one404={originalPath:"${url.pathname}",notFoundPath:"${notFoundRoute}"}</script>`
+              // inject before </head> or at start of <body>
+              const injectedHtml = notFoundHtml.includes('</head>')
+                ? notFoundHtml.replace('</head>', `${notFoundMarker}</head>`)
+                : notFoundHtml.replace('<body', `${notFoundMarker}<body`)
+
+              const headers = new Headers()
+              headers.set('content-type', 'text/html')
+              return new Response(injectedHtml, {
+                headers,
+                status: 404,
+              })
+            }
           }
 
           // no +not-found.html found, return basic 404
@@ -542,6 +571,20 @@ url: ${url}`)
           // this handles all loader refetches or fetches due to navigation
           if (url.pathname.endsWith(LOADER_JS_POSTFIX_UNCACHED)) {
             const originalUrl = getPathFromLoaderPath(url.pathname)
+
+            // for ssg routes with dynamic params, check if this path was statically generated
+            // if not in routeMap, the slug wasn't in generateStaticParams - return 404
+            if (route.type === 'ssg' && Object.keys(route.routeKeys).length > 0) {
+              if (!routeMap[originalUrl]) {
+                return new Response(
+                  make404LoaderJs(originalUrl, 'ssg route not in routeMap'),
+                  {
+                    headers: { 'Content-Type': 'text/javascript' },
+                  }
+                )
+              }
+            }
+
             const finalUrl = new URL(originalUrl, url.origin)
             const cleanedRequest = new Request(finalUrl, request)
             return resolveLoaderRoute(requestHandlers, cleanedRequest, finalUrl, route)
@@ -685,6 +728,17 @@ url: ${url}`)
 
         if (!route.compiledRegex.test(originalUrl)) {
           continue
+        }
+
+        // for ssg routes with dynamic params, check if this path was statically generated
+        if (
+          route.type === 'ssg' &&
+          Object.keys(route.routeKeys).length > 0 &&
+          !routeMap[originalUrl]
+        ) {
+          c.header('Content-Type', 'text/javascript')
+          c.status(200)
+          return c.body(make404LoaderJs(originalUrl, 'ssg route not in routeMap'))
         }
 
         // for now just change this

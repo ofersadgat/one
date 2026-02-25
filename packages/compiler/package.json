@@ -1,6 +1,6 @@
 {
   "name": "@vxrn/compiler",
-  "version": "1.9.2",
+  "version": "1.9.8",
   "type": "module",
   "exports": {
     "./package.json": "./package.json",
@@ -43,7 +43,7 @@
     "vite": "^7.1.12"
   },
   "devDependencies": {
-    "@tamagui/build": "2.0.0-rc.14",
+    "@tamagui/build": "2.0.0-rc.16",
     "depcheck": "^1.4.7",
     "rollup": "^4.29.1"
   },

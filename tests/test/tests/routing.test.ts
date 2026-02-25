@@ -90,6 +90,38 @@ describe(`Routing Tests`, () => {
     })
   })
 
+  describe('Routes with @ in path', { retry: 1 }, () => {
+    it('should handle routes starting with @', async () => {
+      const response = await fetch(`${serverUrl}/@admin`)
+      expect(response.status).toBe(200)
+      const html = await response.text()
+      expect(html).toContain('Handle Page')
+      expect(html).toContain('@admin')
+    })
+
+    it('should handle different @ handles', async () => {
+      const response = await fetch(`${serverUrl}/@username123`)
+      expect(response.status).toBe(200)
+      const html = await response.text()
+      expect(html).toContain('@username123')
+    })
+
+    it('should work without a loader (generateStaticParams only)', async () => {
+      // [atHandle].tsx uses generateStaticParams without a loader
+      const admin = await fetch(`${serverUrl}/@admin`)
+      const user = await fetch(`${serverUrl}/@username123`)
+
+      expect(admin.status).toBe(200)
+      expect(user.status).toBe(200)
+
+      const adminHtml = await admin.text()
+      const userHtml = await user.text()
+
+      expect(adminHtml).toContain('@admin')
+      expect(userHtml).toContain('@username123')
+    })
+  })
+
   describe('SSR routing', { retry: 2, timeout: 60_000 }, () => {
     it('should render static SSR page on direct hit', async () => {
       const response = await fetch(`${serverUrl}/ssr/basic`)
@@ -262,6 +294,93 @@ describe(`Routing Tests`, () => {
           state: 'visible',
         })
         expect(await page.textContent('#server-id')).toBe('tamagui')
+      } finally {
+        await page.close()
+      }
+    })
+  })
+
+  describe('404 inline rendering', { retry: 2, timeout: 60_000 }, () => {
+    // prod-only tests - dev mode doesn't pre-check generateStaticParams
+    it.skipIf(!isProd)(
+      'should render +not-found inline without changing URL for SSG invalid slug',
+      async () => {
+        const page = await context.newPage()
+        try {
+          await page.goto(`${serverUrl}/ssg-not-found/invalid-slug`, {
+            waitUntil: 'domcontentloaded',
+          })
+
+          // wait for 404 content first (proves hydration completed)
+          await page.waitForSelector('[data-testid="ssg-not-found-page"]', {
+            timeout: 10000,
+          })
+
+          // small delay for router to settle URL
+          await page.waitForTimeout(100)
+
+          // URL should stay at the original path
+          expect(page.url()).toContain('/ssg-not-found/invalid-slug')
+
+          // content should be the +not-found page
+          const content = await page.textContent('body')
+          expect(content).toContain('SSG 404: Page not found')
+        } finally {
+          await page.close()
+        }
+      }
+    )
+
+    it('should render +not-found inline without changing URL', async () => {
+      const page = await context.newPage()
+      try {
+        await page.goto(`${serverUrl}/not-found/non-existent-page`, {
+          waitUntil: 'networkidle',
+        })
+
+        // URL should stay at the original path
+        expect(page.url()).toContain('/not-found/non-existent-page')
+
+        // content should be the +not-found page
+        const content = await page.textContent('body')
+        expect(content).toContain('Custom 404: Page not found')
+      } finally {
+        await page.close()
+      }
+    })
+
+    it('should render nested +not-found inline without changing URL', async () => {
+      const page = await context.newPage()
+      try {
+        await page.goto(`${serverUrl}/not-found/deep/non-existent-page`, {
+          waitUntil: 'networkidle',
+        })
+
+        // URL should stay at the original path
+        expect(page.url()).toContain('/not-found/deep/non-existent-page')
+
+        // content should be the deep +not-found page
+        const content = await page.textContent('body')
+        expect(content).toContain('Custom Deep 404: Page not found')
+      } finally {
+        await page.close()
+      }
+    })
+
+    it('should use nearest ancestor +not-found when no local one exists', async () => {
+      const page = await context.newPage()
+      try {
+        // /not-found/fallback/ has no +not-found, should use /not-found/+not-found
+        await page.goto(`${serverUrl}/not-found/fallback/non-existent-page`, {
+          waitUntil: 'networkidle',
+        })
+
+        // URL should stay at the original path
+        expect(page.url()).toContain('/not-found/fallback/non-existent-page')
+
+        // content should be the parent +not-found page
+        const content = await page.textContent('body')
+        expect(content).toContain('Custom 404: Page not found')
       } finally {
         await page.close()
       }

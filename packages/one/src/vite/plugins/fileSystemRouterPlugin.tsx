@@ -50,6 +50,34 @@ export function createFileSystemRouterPlugin(options: One.PluginOptions): Plugin
 
   function createRequestHandler() {
     const routerRoot = getRouterRootFromOneOptions(options)
+
+    // find the nearest +not-found route by walking up from a route's directory
+    async function findNearestNotFoundPath(routeFile: string): Promise<string> {
+      const routeDir = routeFile.replace(/\/[^/]+$/, '')
+      let searchDir = routeDir
+      while (true) {
+        for (const ext of ['.tsx', '.ts', '.jsx', '.js']) {
+          const candidate = path.join(routerRoot, searchDir, `+not-found${ext}`)
+          try {
+            const mod = await runner.import(candidate)
+            if (mod?.default) {
+              return searchDir ? `/${searchDir}/+not-found` : '/+not-found'
+            }
+          } catch {
+            // not found at this level
+          }
+        }
+        if (!searchDir) break
+        const parent = searchDir.replace(/\/[^/]+$/, '')
+        if (parent === searchDir) {
+          searchDir = ''
+        } else {
+          searchDir = parent
+        }
+      }
+      return '/+not-found'
+    }
+
     return createHandleRequest(
       {
         async handlePage({ route, url, loaderProps }) {
@@ -214,9 +242,70 @@ export function createFileSystemRouterPlugin(options: One.PluginOptions): Plugin
 
             LoaderDataCache[route.file] = loaderData
 
-            const is404 = route.isNotFound || !getPageExport(exported)
+            // detect 404: not-found routes, missing page exports, or ssg dynamic routes with invalid slugs
+            const isDynamicRoute = Object.keys(route.routeKeys || {}).length > 0
 
-            const html = await render({
+            // for ssg dynamic routes, check generateStaticParams to validate the slug
+            let isMissingSsgSlug = false
+            if (route.type === 'ssg' && isDynamicRoute && exported.generateStaticParams) {
+              const staticParams = await exported.generateStaticParams({
+                params: loaderProps?.params,
+              })
+              const currentParams = loaderProps?.params || {}
+              isMissingSsgSlug = !staticParams.some((sp: Record<string, string>) =>
+                Object.keys(sp).every((key) => sp[key] === currentParams[key])
+              )
+            }
+
+            const is404 = route.isNotFound || !getPageExport(exported) || isMissingSsgSlug
+
+            // for ssg dynamic routes with invalid slug, find and render the nearest +not-found page
+            let notFoundRoutePath: string | null = null
+            if (isMissingSsgSlug) {
+              // find nearest +not-found by walking up the route's directory
+              // strip leading ./ and file name to get directory
+              const routeDir = route.file.replace(/^\.\//, '').replace(/\/[^/]+$/, '')
+              let searchDir = routeDir
+              while (true) {
+                for (const ext of ['.tsx', '.ts', '.jsx', '.js']) {
+                  const candidate = path.join(routerRoot, searchDir, `+not-found${ext}`)
+                  try {
+                    const notFoundExported = await runner.import(candidate)
+                    if (notFoundExported?.default) {
+                      notFoundRoutePath = searchDir
+                        ? `/${searchDir}/+not-found`
+                        : '/+not-found'
+                      break
+                    }
+                  } catch {
+                    // not found at this level
+                  }
+                }
+                if (notFoundRoutePath || !searchDir) break
+                const parent = searchDir.replace(/\/[^/]+$/, '')
+                if (parent === searchDir) {
+                  searchDir = ''
+                } else {
+                  searchDir = parent
+                }
+              }
+
+              // if no +not-found page exists, return basic 404
+              if (!notFoundRoutePath) {
+                return new Response(
+                  '<html><body><h1>404 - Not Found</h1></body></html>',
+                  {
+                    status: 404,
+                    headers: { 'Content-Type': 'text/html' },
+                  }
+                )
+              }
+            }
+
+            // for 404 with notFoundRoutePath, render the +not-found page at that path
+            const renderPath = notFoundRoutePath || loaderProps?.path || '/'
+
+            let html = await render({
               mode: isSpaShell
                 ? 'spa-shell'
                 : route.type === 'ssg'
@@ -226,12 +315,20 @@ export function createFileSystemRouterPlugin(options: One.PluginOptions): Plugin
                     : 'spa',
               loaderData,
               loaderProps,
-              path: loaderProps?.path || '/',
+              path: renderPath,
               preloads,
               matches,
             })
 
             if (is404) {
+              // inject 404 marker for client-side not-found state awareness
+              if (notFoundRoutePath) {
+                const originalPath = loaderProps?.path || '/'
+                const notFoundMarker = `<script>window.__one404={originalPath:${JSON.stringify(originalPath)},notFoundPath:${JSON.stringify(notFoundRoutePath)}}</script>`
+                html = html.includes('</head>')
+                  ? html.replace('</head>', `${notFoundMarker}</head>`)
+                  : html.replace('<body', `${notFoundMarker}<body`)
+              }
               return new Response(html, {
                 status: 404,
                 headers: { 'Content-Type': 'text/html' },
@@ -298,34 +395,64 @@ export function createFileSystemRouterPlugin(options: One.PluginOptions): Plugin
 
           const exported = await runner.import(routeFile)
 
+          // for ssg dynamic routes, check generateStaticParams to validate the slug
+          const isDynamicRoute = Object.keys(route.routeKeys || {}).length > 0
+          if (route.type === 'ssg' && isDynamicRoute && exported.generateStaticParams) {
+            const staticParams = await exported.generateStaticParams({
+              params: loaderProps?.params,
+            })
+            const currentParams = loaderProps?.params || {}
+            const isValidSlug = staticParams.some((sp: Record<string, string>) =>
+              Object.keys(sp).every((key) => sp[key] === currentParams[key])
+            )
+            if (!isValidSlug) {
+              const nfPath = await findNearestNotFoundPath(route.file)
+              return `export function loader(){return{__oneError:404,__oneErrorMessage:'Not Found',__oneNotFoundPath:${JSON.stringify(nfPath)}}}`
+            }
+          }
+
           // Track file dependencies from loader for hot reload
           let loaderData: any
           if (exported.loader) {
-            const tracked = await trackLoaderDependencies(() =>
-              exported.loader(loaderProps)
-            )
-            loaderData = tracked.result
+            try {
+              const tracked = await trackLoaderDependencies(() =>
+                exported.loader(loaderProps)
+              )
+              loaderData = tracked.result
 
-            // if the loader returned a Response (e.g. redirect()), throw it
-            // so it bubbles up through resolveResponse and can be transformed
-            // into a JS redirect module for client-side navigation
-            if (isResponse(loaderData)) {
-              throw loaderData
-            }
-
-            // Register dependencies: map file path -> route paths that depend on it
-            const routePath = loaderProps?.path || '/'
-            for (const dep of tracked.dependencies) {
-              // Resolve to absolute path for consistent lookup when file changes
-              const absoluteDep = path.resolve(dep)
-              if (!loaderFileDependencies.has(absoluteDep)) {
-                loaderFileDependencies.set(absoluteDep, new Set())
-                server?.watcher.add(absoluteDep)
-                if (debugLoaderDeps) {
-                  console.info(` ⓵  [loader-dep] watching: ${absoluteDep}`)
-                }
+              // if the loader returned a Response (e.g. redirect()), throw it
+              // so it bubbles up through resolveResponse and can be transformed
+              // into a JS redirect module for client-side navigation
+              if (isResponse(loaderData)) {
+                throw loaderData
               }
-              loaderFileDependencies.get(absoluteDep)!.add(routePath)
+
+              // Register dependencies: map file path -> route paths that depend on it
+              const routePath = loaderProps?.path || '/'
+              for (const dep of tracked.dependencies) {
+                // Resolve to absolute path for consistent lookup when file changes
+                const absoluteDep = path.resolve(dep)
+                if (!loaderFileDependencies.has(absoluteDep)) {
+                  loaderFileDependencies.set(absoluteDep, new Set())
+                  server?.watcher.add(absoluteDep)
+                  if (debugLoaderDeps) {
+                    console.info(` ⓵  [loader-dep] watching: ${absoluteDep}`)
+                  }
+                }
+                loaderFileDependencies.get(absoluteDep)!.add(routePath)
+              }
+            } catch (err) {
+              // re-throw Response errors (redirects)
+              if (isResponse(err)) {
+                throw err
+              }
+              // for file-not-found errors (e.g., missing MDX for non-existent slug),
+              // return a 404 signal so the client navigates to +not-found
+              if ((err as any)?.code === 'ENOENT') {
+                const nfPath = await findNearestNotFoundPath(route.file)
+                return `export function loader(){return{__oneError:404,__oneErrorMessage:'Not Found',__oneNotFoundPath:${JSON.stringify(nfPath)}}}`
+              }
+              throw err
             }
           }
 

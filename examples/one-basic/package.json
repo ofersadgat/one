@@ -1,9 +1,10 @@
 {
   "name": "example-basic",
-  "version": "1.9.2",
+  "version": "1.9.8",
   "private": true,
   "type": "module",
   "scripts": {
+    "postinstall": "one patch || true",
     "android": "one run:android",
     "build:web": "one build",
     "clean": "one clean",

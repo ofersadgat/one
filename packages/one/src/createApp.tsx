@@ -164,6 +164,12 @@ export function createApp(options: CreateAppProps) {
     initClientMatches(serverContext.matches)
   }
 
+  // NOTE: for SSG 404 pages, we DON'T set notFoundState before initial render
+  // because the server rendered the +not-found page through normal routing
+  // setting notFoundState would cause useSlot to skip the layout hierarchy,
+  // leading to hydration mismatch
+  // notFoundState is only set for client-side navigations that result in 404
+
   // Wait for setup file to complete first (if provided)
   // This ensures setup code (error handlers, analytics, etc.) runs before the app
   // The function is called here at runtime, not at module evaluation time during build
@@ -180,6 +186,22 @@ export function createApp(options: CreateAppProps) {
         return mod
       })
     : [options.routes[`/${options.routerRoot}/_layout.tsx`]?.()]
+
+  // for 404 pages, use history.state.__tempLocation to route to notFoundPath
+  // without changing the browser URL. the router checks __tempLocation and uses
+  // that path for routing instead of the URL. this ensures hydration matches
+  // the server-rendered +not-found page while keeping the original URL intact
+  const one404Marker = (window as any).__one404
+  if (one404Marker?.notFoundPath) {
+    const currentState = window.history.state || {}
+    window.history.replaceState(
+      {
+        ...currentState,
+        __tempLocation: { pathname: one404Marker.notFoundPath, search: '' },
+      },
+      ''
+    )
+  }
 
   return setupComplete
     .then(() => Promise.all(preloadPromises))

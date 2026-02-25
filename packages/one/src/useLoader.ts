@@ -1,8 +1,9 @@
 import { useCallback, useSyncExternalStore } from 'react'
 import { registerDevtoolsFunction } from './devtools/registry'
 import { useParams, usePathname } from './hooks'
+import { findNearestNotFoundRoute, setNotFoundState } from './notFoundState'
 import { router } from './router/imperative-api'
-import { preloadedLoaderData, preloadingLoader } from './router/router'
+import { preloadedLoaderData, preloadingLoader, routeNode } from './router/router'
 import { getLoaderPath } from './utils/cleanUrl'
 import { dynamicImport } from './utils/dynamicImport'
 import { weakKey } from './utils/weakKey'
@@ -32,37 +33,38 @@ export type LoaderTimingEntry = {
 const loaderTimingHistory: LoaderTimingEntry[] = []
 const MAX_TIMING_HISTORY = 50
 
-function recordLoaderTiming(entry: LoaderTimingEntry) {
-  if (process.env.NODE_ENV !== 'development') return
+const recordLoaderTiming =
+  process.env.NODE_ENV === 'development'
+    ? (entry: LoaderTimingEntry) => {
+        loaderTimingHistory.unshift(entry)
+        if (loaderTimingHistory.length > MAX_TIMING_HISTORY) {
+          loaderTimingHistory.pop()
+        }
+        // Dispatch event for devtools (web only - CustomEvent doesn't exist on native)
+        if (typeof window !== 'undefined' && typeof CustomEvent !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('one-loader-timing', { detail: entry }))
 
-  loaderTimingHistory.unshift(entry)
-  if (loaderTimingHistory.length > MAX_TIMING_HISTORY) {
-    loaderTimingHistory.pop()
-  }
-  // Dispatch event for devtools (web only - CustomEvent doesn't exist on native)
-  if (typeof window !== 'undefined' && typeof CustomEvent !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('one-loader-timing', { detail: entry }))
-
-    // Also dispatch error event if there was an error
-    if (entry.error) {
-      window.dispatchEvent(
-        new CustomEvent('one-error', {
-          detail: {
-            error: {
-              message: entry.error,
-              name: 'LoaderError',
-            },
-            route: {
-              pathname: entry.path,
-            },
-            timestamp: Date.now(),
-            type: 'loader',
-          },
-        })
-      )
-    }
-  }
-}
+          // Also dispatch error event if there was an error
+          if (entry.error) {
+            window.dispatchEvent(
+              new CustomEvent('one-error', {
+                detail: {
+                  error: {
+                    message: entry.error,
+                    name: 'LoaderError',
+                  },
+                  route: {
+                    pathname: entry.path,
+                  },
+                  timestamp: Date.now(),
+                  type: 'loader',
+                },
+              })
+            )
+          }
+        }
+      }
+    : undefined
 
 export function getLoaderTimingHistory(): LoaderTimingEntry[] {
   return loaderTimingHistory
@@ -146,7 +148,7 @@ export async function refetchLoader(pathname: string): Promise<void> {
 
     // detect server redirect signal during refetch
     if (result?.__oneRedirect) {
-      recordLoaderTiming({
+      recordLoaderTiming?.({
         path: pathname,
         startTime,
         moduleLoadTime,
@@ -163,6 +165,26 @@ export async function refetchLoader(pathname: string): Promise<void> {
       return
     }
 
+    // detect 404 error signal during refetch
+    // render 404 inline at current URL instead of navigating
+    if (result?.__oneError === 404) {
+      recordLoaderTiming?.({
+        path: pathname,
+        startTime,
+        moduleLoadTime,
+        executionTime,
+        totalTime,
+        source: 'refetch',
+      })
+      const notFoundRoute = findNearestNotFoundRoute(pathname, routeNode)
+      setNotFoundState({
+        notFoundPath: result.__oneNotFoundPath || '/+not-found',
+        notFoundRouteNode: notFoundRoute || undefined,
+        originalPath: pathname,
+      })
+      return
+    }
+
     updateState(pathname, {
       data: result,
       state: 'idle',
@@ -170,7 +192,7 @@ export async function refetchLoader(pathname: string): Promise<void> {
       hasLoadedOnce: true,
     })
 
-    recordLoaderTiming({
+    recordLoaderTiming?.({
       path: pathname,
       startTime,
       moduleLoadTime,
@@ -186,7 +208,7 @@ export async function refetchLoader(pathname: string): Promise<void> {
       state: 'idle',
     })
 
-    recordLoaderTiming({
+    recordLoaderTiming?.({
       path: pathname,
       startTime,
       totalTime,
@@ -360,7 +382,7 @@ export function useLoaderState<
 
               // detect server redirect signal on native
               if (data?.__oneRedirect) {
-                recordLoaderTiming({
+                recordLoaderTiming?.({
                   path: currentPath,
                   startTime,
                   moduleLoadTime,
@@ -377,13 +399,33 @@ export function useLoaderState<
                 return
               }
 
+              // detect 404 error signal on native
+              // render 404 inline at current URL instead of navigating
+              if (data?.__oneError === 404) {
+                recordLoaderTiming?.({
+                  path: currentPath,
+                  startTime,
+                  moduleLoadTime,
+                  executionTime,
+                  totalTime,
+                  source: 'initial',
+                })
+                const notFoundRoute = findNearestNotFoundRoute(currentPath, routeNode)
+                setNotFoundState({
+                  notFoundPath: data.__oneNotFoundPath || '/+not-found',
+                  notFoundRouteNode: notFoundRoute || undefined,
+                  originalPath: currentPath,
+                })
+                return
+              }
+
               updateState(currentPath, {
                 data,
                 hasLoadedOnce: true,
                 promise: undefined,
               })
 
-              recordLoaderTiming({
+              recordLoaderTiming?.({
                 path: currentPath,
                 startTime,
                 moduleLoadTime,
@@ -398,7 +440,7 @@ export function useLoaderState<
                 data: {},
                 promise: undefined,
               })
-              recordLoaderTiming({
+              recordLoaderTiming?.({
                 path: currentPath,
                 startTime,
                 totalTime,
@@ -434,7 +476,7 @@ export function useLoaderState<
 
           // detect server redirect signal (fallback if preload didn't catch it)
           if (result?.__oneRedirect) {
-            recordLoaderTiming({
+            recordLoaderTiming?.({
               path: currentPath,
               startTime,
               moduleLoadTime,
@@ -451,13 +493,32 @@ export function useLoaderState<
             return
           }
 
+          // detect 404 error signal - render 404 inline at current URL
+          if (result?.__oneError === 404) {
+            recordLoaderTiming?.({
+              path: currentPath,
+              startTime,
+              moduleLoadTime,
+              executionTime,
+              totalTime,
+              source: 'initial',
+            })
+            const notFoundRoute = findNearestNotFoundRoute(currentPath, routeNode)
+            setNotFoundState({
+              notFoundPath: result.__oneNotFoundPath || '/+not-found',
+              notFoundRouteNode: notFoundRoute || undefined,
+              originalPath: currentPath,
+            })
+            return
+          }
+
           updateState(currentPath, {
             data: result,
             hasLoadedOnce: true,
             promise: undefined,
           })
 
-          recordLoaderTiming({
+          recordLoaderTiming?.({
             path: currentPath,
             startTime,
             moduleLoadTime,
@@ -473,7 +534,7 @@ export function useLoaderState<
             promise: undefined,
           })
 
-          recordLoaderTiming({
+          recordLoaderTiming?.({
             path: currentPath,
             startTime,
             totalTime,
